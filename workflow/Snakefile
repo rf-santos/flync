@@ -1,0 +1,440 @@
+import pandas as pd
+import os
+
+configfile: "config/config.yaml"
+
+print("Snakefile loaded.")
+
+# --- Sample Sheet Parsing ---
+try:
+    SAMPLE_SHEET = pd.read_csv(config["sample_sheet"], sep='\t').set_index("sample_id", drop=False)
+    SAMPLE_IDS = SAMPLE_SHEET.index.tolist()
+    print(f"Successfully loaded sample sheet. Sample IDs: {SAMPLE_IDS}")
+    expected_columns = {"sample_id", "type", "fq1", "fq2", "sra_accession"}
+    if not expected_columns.issubset(SAMPLE_SHEET.columns):
+        missing_cols = expected_columns - set(SAMPLE_SHEET.columns)
+        raise ValueError(f"Sample sheet is missing required columns: {missing_cols}")
+except FileNotFoundError:
+    print(f"Error: Sample sheet '{config['sample_sheet']}' not found. Please create it.")
+    SAMPLE_IDS = []
+except Exception as e:
+    print(f"Error loading or parsing sample sheet: {e}")
+    SAMPLE_IDS = []
+# --- End Sample Sheet Parsing ---
+
+
+# --- Helper functions for input determination ---
+def get_fastq1(wildcards):
+    sample_info = SAMPLE_SHEET.loc[wildcards.sample_id]
+    if pd.notna(sample_info.get("sra_accession")) and str(sample_info["sra_accession"]).strip() != "":
+        return os.path.join(config["sra_download_dir"], wildcards.sample_id, f"{wildcards.sample_id}_1.fastq.gz")
+    elif pd.notna(sample_info.get("fq1")):
+        return sample_info["fq1"]
+    else:
+        raise ValueError(f"Sample {wildcards.sample_id} has no valid sra_accession or fq1 defined.")
+
+def get_fastq2(wildcards):
+    sample_info = SAMPLE_SHEET.loc[wildcards.sample_id]
+    if sample_info["type"].upper() == "PAIRED":
+        if pd.notna(sample_info.get("sra_accession")) and str(sample_info["sra_accession"]).strip() != "":
+            return os.path.join(config["sra_download_dir"], wildcards.sample_id, f"{wildcards.sample_id}_2.fastq.gz")
+        elif pd.notna(sample_info.get("fq2")):
+            return sample_info["fq2"]
+        else:
+            raise ValueError(f"Paired-end sample {wildcards.sample_id} has no valid sra_accession or fq2 defined.")
+    return []
+
+def get_hisat2_layout_opts(wildcards, input):
+    sample_info = SAMPLE_SHEET.loc[wildcards.sample_id]
+    if sample_info["type"].upper() == "PAIRED":
+        if not input.fq2:
+             raise ValueError(f"Missing fq2 for paired-end sample {wildcards.sample_id}")
+        return f"-1 {input.fq1} -2 {input.fq2}"
+    else:
+        return f"-U {input.fq1}"
+
+# --- Function to get track names for expand ---
+def get_track_names(config_feature_tracks):
+    if isinstance(config_feature_tracks, list): # check if feature_tracks is a list
+        return [track["name"] for track in config_feature_tracks if isinstance(track, dict) and "name" in track]
+    return []
+# --- End Helper Functions ---
+
+# --- Determine Final Targets for Rule All ---
+FINAL_TARGETS = [
+    config["genome_dir"] + "/genome.fa",
+    config["genome_dir"] + "/genome.gtf",
+    config["sra_info_csv"],
+    config["splice_sites_file"],
+    directory(config["hisat2_index_dir"]),
+    config["merged_gtf_dir"] + "/" + config["merged_gtf_name"],
+    config["merged_gtf_dir"] + "/" + config["merged_new_transcripts_gtf_name"],
+    config["merged_gtf_dir"] + "/" + config["merged_transcripts_fasta_name"],
+    config["merged_gtf_dir"] + "/" + config["merged_new_transcripts_fasta_name"],
+    config["comparison_dir"] + "/cuffcomp.combined.gtf",
+    config["cpat_dir"] + "/cpat.ORF_prob.best.tsv",
+    config["final_non_coding_gtf"],
+    config["final_coding_gtf"],
+    config["final_feature_table_csv"], # Added feature table
+]
+if SAMPLE_IDS:
+    FINAL_TARGETS.extend(expand(config["mapping_dir"] + "/{sample_id}/{sample_id}.sorted.bam", sample_id=SAMPLE_IDS))
+    FINAL_TARGETS.extend(expand(config["mapping_dir"] + "/{sample_id}/{sample_id}.sorted.bam.bai", sample_id=SAMPLE_IDS))
+    FINAL_TARGETS.extend(expand(directory(config["ballgown_input_dir"] + "/{sample_id}"), sample_id=SAMPLE_IDS))
+
+if config.get("metadata_file") and str(config.get("metadata_file")).strip() not in [None, "None", "null", ""]:
+    print(f"Metadata file provided ({config['metadata_file']}), adding DGE targets to rule all.")
+    FINAL_TARGETS.extend([
+        os.path.join(config["dge_dir"], config["dge_transcripts_file"]),
+        os.path.join(config["dge_dir"], config["transcript_expressions_file"]),
+    ])
+else:
+    print("No metadata file provided. Skipping DGE targets.")
+
+
+rule all:
+    input: FINAL_TARGETS
+
+
+# --- CPAT Model Download ---
+rule download_cpat_models:
+    output:
+        hexamer = config["cpat_hexamer_file"],
+        logit_model = config["cpat_logit_model_file"],
+        cutoff = config["cpat_cutoff_file"]
+    params:
+        model_dir = os.path.dirname(config["cpat_hexamer_file"]),
+        hex_url = "https://sourceforge.net/projects/cpat/files/v1.2.2/CPAT_v1.2.2_standalone/Dm_Hexamer.tsv/download",
+        logit_url = "https://sourceforge.net/projects/cpat/files/v1.2.2/CPAT_v1.2.2_standalone/Dm_logitModel.RData/download",
+        cutoff_val = "0.364"
+    shell:
+        "mkdir -p {params.model_dir} && "
+        " (wget -q -O {output.hexamer} {params.hex_url} || echo 'Failed to download hexamer model, placeholder created.' > {output.hexamer}) && "
+        " (wget -q -O {output.logit_model} {params.logit_url} || echo 'Failed to download logit model, placeholder created.' > {output.logit_model}) && "
+        " echo '{params.cutoff_val}' > {output.cutoff}"
+
+# --- Genome and SRA Prep ---
+rule prepare_genome:
+    output:
+        genome_fasta = config["genome_dir"] + "/genome.fa",
+        genome_gtf = config["genome_dir"] + "/genome.gtf"
+    params: # ... (params remain the same)
+        genome_dir = config["genome_dir"],
+        ensembl_base_url = config["ensembl_base_url"],
+        ensembl_gtf_url = config["ensembl_gtf_url"],
+        genome_fasta_name = config["genome_fasta_name"],
+        chromosomes = config["genome_chromosomes"]
+    script: "scripts/prepare_genome.py"
+
+rule get_sra_info:
+    input: sra_list = config["sra_accession_file"]
+    output: sra_csv = config["sra_info_csv"]
+    conda: "envs/sra_tools.yaml"
+    script: "scripts/get_sra_info.py"
+
+# --- HISAT2 ---
+rule hisat2_extract_splice_sites:
+    input: gtf = config["genome_dir"] + "/genome.gtf"
+    output: splice_sites = config["splice_sites_file"]
+    conda: "envs/aligners.yaml"
+    shell: "hisat2_extract_splice_sites.py {input.gtf} > {output.splice_sites}"
+
+rule hisat2_index:
+    input: genome_fasta = config["genome_dir"] + "/genome.fa"
+    output: idx_dir = directory(config["hisat2_index_dir"])
+    params: prefix = config["hisat2_index_prefix"], threads = 8
+    conda: "envs/aligners.yaml"
+    shell: "mkdir -p $(dirname {params.prefix}) && hisat2-build -p {params.threads} {input.genome_fasta} {params.prefix}"
+
+rule sra_fastq_download:
+    output: # ... (outputs remain the same)
+        fq1 = temp(os.path.join(config["sra_download_dir"], "{sample_id}", "{sample_id}_1.fastq")),
+        fq2 = temp(os.path.join(config["sra_download_dir"], "{sample_id}", "{sample_id}_2.fastq")),
+        fq1_gz = os.path.join(config["sra_download_dir"], "{sample_id}", "{sample_id}_1.fastq.gz"),
+        fq2_gz = os.path.join(config["sra_download_dir"], "{sample_id}", "{sample_id}_2.fastq.gz")
+    params: # ... (params remain the same)
+        sra_id = lambda wildcards: SAMPLE_SHEET.loc[wildcards.sample_id, "sra_accession"],
+        outdir = os.path.join(config["sra_download_dir"], "{sample_id}"),
+        threads = 4
+    conda: "envs/aligners.yaml"
+    run: # ... (run block remains the same)
+        sra_id_val = str(params.sra_id).strip()
+        if not sra_id_val or pd.isna(sra_id_val) or sra_id_val.lower() == 'nan' or sra_id_val == "":
+            for f_path in [output.fq1, output.fq2, output.fq1_gz, output.fq2_gz]:
+                shell(f"mkdir -p $(dirname {f_path}) && touch {f_path}")
+            print(f"Sample {wildcards.sample_id} is not SRA-based or SRA ID is missing. Created dummy FASTQ outputs.")
+            return
+
+        os.makedirs(params.outdir, exist_ok=True)
+        shell(f"prefetch -O {params.outdir} {sra_id_val}")
+
+        sra_file_path_primary = os.path.join(params.outdir, sra_id_val, f"{sra_id_val}.sra")
+        sra_file_path_secondary = os.path.join(params.outdir, f"{sra_id_val}.sra")
+
+        actual_sra_path = ""
+        if os.path.exists(sra_file_path_primary):
+            actual_sra_path = sra_file_path_primary
+        elif os.path.exists(sra_file_path_secondary):
+            actual_sra_path = sra_file_path_secondary
+        else:
+            raise FileNotFoundError(f"SRA file for {sra_id_val} not found after prefetch in expected locations.")
+
+        sample_info = SAMPLE_SHEET.loc[wildcards.sample_id]
+        fastq_dump_cmd = f"fasterq-dump -f -3 -e {params.threads} -O {params.outdir} -o {wildcards.sample_id}.fastq {actual_sra_path}"
+        if sample_info["type"].upper() == "PAIRED":
+            fastq_dump_cmd += " --split-files"
+        shell(fastq_dump_cmd)
+
+        shell(f"gzip -f {output.fq1}")
+        if sample_info["type"].upper() == "PAIRED":
+            if os.path.exists(str(output.fq2)): shell(f"gzip -f {output.fq2}")
+            else: shell(f"touch {output.fq2_gz}")
+        else: shell(f"touch {output.fq2_gz}")
+
+rule hisat2_map_sort:
+    input: # ... (inputs remain the same)
+        fq1 = get_fastq1,
+        fq2 = get_fastq2,
+        index_dir_ready = config["hisat2_index_dir"],
+        splice_sites = config["splice_sites_file"]
+    output: # ... (outputs remain the same)
+        bam = os.path.join(config["mapping_dir"], "{sample_id}", "{sample_id}.sorted.bam"),
+        bai = os.path.join(config["mapping_dir"], "{sample_id}", "{sample_id}.sorted.bam.bai")
+    params: # ... (params remain the same)
+        index_prefix = config["hisat2_index_prefix"],
+        hisat2_options = config["hisat2_options"],
+        layout_opts = get_hisat2_layout_opts,
+        sam_file = temp(os.path.join(config["mapping_dir"], "{sample_id}", "{sample_id}.sam")),
+        unsorted_bam_file = temp(os.path.join(config["mapping_dir"], "{sample_id}", "{sample_id}.bam")),
+        threads = 8
+    conda: "envs/aligners.yaml"
+    log: # ... (logs remain the same)
+        err = os.path.join(config["mapping_dir"], "{sample_id}", "{sample_id}.hisat2.log"),
+        samtools_sort_log = os.path.join(config["mapping_dir"], "{sample_id}", "{sample_id}.samtools_sort.log"),
+        samtools_index_log = os.path.join(config["mapping_dir"], "{sample_id}", "{sample_id}.samtools_index.log")
+    shell: # ... (shell command remains the same)
+        "mkdir -p {config[mapping_dir]}/{wildcards.sample_id} && "
+        "hisat2 -p {params.threads} -x {params.index_prefix} {params.layout_opts} {params.hisat2_options} "
+        "--known-splicesite-infile {input.splice_sites} -S {params.sam_file} 2> {log.err} && "
+        "samtools view -@ {params.threads} -b -o {params.unsorted_bam_file} {params.sam_file} && "
+        "samtools sort -@ {params.threads} -o {output.bam} {params.unsorted_bam_file} > {log.samtools_sort_log} 2>&1 && "
+        "samtools index {output.bam} > {log.samtools_index_log} 2>&1"
+
+# --- StringTie ---
+rule stringtie_assemble: # ... (rule remains the same)
+    input:
+        bam = os.path.join(config["mapping_dir"], "{sample_id}", "{sample_id}.sorted.bam"),
+        ref_gtf = config["genome_dir"] + "/genome.gtf"
+    output:
+        gtf = os.path.join(config["assembly_dir"], "{sample_id}", "{sample_id}_assembled.gtf")
+    params:
+        opts = config["stringtie_assemble_options"],
+        threads = config.get("threads_stringtie_assemble", 8)
+    conda: "envs/assemblers.yaml"
+    log: os.path.join(config["assembly_dir"], "{sample_id}", "{sample_id}_assemble.log")
+    shell:
+        "mkdir -p $(dirname {output.gtf}) && "
+        "stringtie {input.bam} -G {input.ref_gtf} -o {output.gtf} -p {params.threads} {params.opts} > {log} 2>&1"
+
+rule stringtie_merge_and_compare: # ... (rule remains the same)
+    input:
+        sample_gtfs = expand(os.path.join(config["assembly_dir"], "{sample_id}", "{sample_id}_assembled.gtf"), sample_id=SAMPLE_IDS) if SAMPLE_IDS else [],
+        ref_gtf = config["genome_dir"] + "/genome.gtf",
+        ref_fasta = config["genome_dir"] + "/genome.fa"
+    output: # ... (outputs remain the same)
+        merged_gtf = os.path.join(config["merged_gtf_dir"], config["merged_gtf_name"]),
+        merged_new_gtf = os.path.join(config["merged_gtf_dir"], config["merged_new_transcripts_gtf_name"]),
+        merged_fasta = os.path.join(config["merged_gtf_dir"], config["merged_transcripts_fasta_name"]),
+        merged_new_fasta = os.path.join(config["merged_gtf_dir"], config["merged_new_transcripts_fasta_name"]),
+        cuffcomp_combined_gtf = os.path.join(config["comparison_dir"], "cuffcomp.combined.gtf"),
+        cuffcomp_tracking = os.path.join(config["comparison_dir"], "cuffcomp.tracking")
+    params: # ... (params remain the same)
+        merge_opts = config["stringtie_merge_options"],
+        assembly_list_file = temp(os.path.join(config["merged_gtf_dir"], "assembly_list.txt")),
+        comparison_prefix = os.path.join(config["comparison_dir"], "cuffcomp"),
+        cuffcompare_opts = config["cuffcompare_options"],
+        threads = config.get("threads_stringtie_merge", 8),
+        stringtie_prefix = config["stringtie_merge_options"].split("-l")[-1].strip().split(" ")[0] if "-l" in config["stringtie_merge_options"] else "MSTRG"
+    conda: "envs/assemblers.yaml"
+    log: # ... (logs remain the same)
+        merge_log = os.path.join(config["merged_gtf_dir"], "stringtie_merge.log"),
+        cuffcompare_log = os.path.join(config["comparison_dir"], "cuffcompare.log"),
+        gffread_log = os.path.join(config["merged_gtf_dir"], "gffread.log"),
+        gffread_new_log = os.path.join(config["merged_gtf_dir"], "gffread_new.log")
+    shell: # ... (shell command remains the same)
+        "mkdir -p {config[merged_gtf_dir]} {config[comparison_dir]} && "
+        "echo -n '' > {params.assembly_list_file} && "
+        "for gtf_file in {input.sample_gtfs}; do if [ -s $$gtf_file ]; then echo $$gtf_file >> {params.assembly_list_file}; fi; done && "
+        "if [ -s {params.assembly_list_file} ]; then "
+        "  stringtie --merge {params.assembly_list_file} -G {input.ref_gtf} -o {output.merged_gtf} -p {params.threads} {params.merge_opts} > {log.merge_log} 2>&1 && "
+        "  cuffcompare {params.cuffcompare_opts} -r {input.ref_gtf} -o {params.comparison_prefix} {output.merged_gtf} > {log.cuffcompare_log} 2>&1 && "
+        "  gffread -w {output.merged_fasta} -g {input.ref_fasta} {output.merged_gtf} > {log.gffread_log} 2>&1 && "
+        """  awk -F '\\t' -v prefix="{params.stringtie_prefix}" '{{ if ($3 == "transcript" && $9 ~ ("transcript_id \\"" prefix)) print }}' {output.merged_gtf} > {output.merged_new_gtf} && """
+        "  gffread -w {output.merged_new_fasta} -g {input.ref_fasta} {output.merged_new_gtf} > {log.gffread_new_log} 2>&1 ; "
+        "else "
+        "  echo 'Assembly list is empty, creating dummy outputs for merge and compare step.' >&2 && "
+        "  touch {output.merged_gtf} {output.merged_new_gtf} {output.merged_fasta} {output.merged_new_fasta} {output.cuffcomp_combined_gtf} {output.cuffcomp_tracking} ; "
+        "fi"
+
+rule stringtie_quantify_ballgown: # ... (rule remains the same)
+    input:
+        bam = os.path.join(config["mapping_dir"], "{sample_id}", "{sample_id}.sorted.bam"),
+        merged_gtf = os.path.join(config["merged_gtf_dir"], config["merged_gtf_name"])
+    output:
+        sample_ballgown_dir = directory(os.path.join(config["ballgown_input_dir"], "{sample_id}"))
+    params:
+        opts = config["stringtie_quant_options"],
+        out_prefix = os.path.join(config["ballgown_input_dir"], "{sample_id}", "{sample_id}"),
+        threads = config.get("threads_stringtie_quant", 8)
+    conda: "envs/assemblers.yaml"
+    log: os.path.join(config["ballgown_input_dir"], "{sample_id}", "{sample_id}_quant.log")
+    shell:
+        "mkdir -p {output.sample_ballgown_dir} && "
+        "if [ -s {input.merged_gtf} ]; then "
+        "  stringtie {input.bam} -G {input.merged_gtf} {params.opts} -p {params.threads} -o {params.out_prefix}.gtf > {log} 2>&1 ; "
+        "else "
+        "  echo 'Merged GTF is empty, skipping StringTie quantification. Creating dummy output GTF.' > {log} 2>&1 && "
+        "  touch {params.out_prefix}.gtf ; "
+        "fi"
+
+# --- CPAT and Classification ---
+rule run_cpat: # ... (rule remains the same)
+    input:
+        new_transcripts_fasta = os.path.join(config["merged_gtf_dir"], config["merged_new_transcripts_fasta_name"]),
+        hexamer = config["cpat_hexamer_file"],
+        logit_model = config["cpat_logit_model_file"]
+    output: # ... (outputs remain the same)
+        orf_prob = os.path.join(config["cpat_dir"], "cpat.ORF_prob.best.tsv"),
+        no_orf = os.path.join(config["cpat_dir"], "cpat.no_ORF.txt"),
+        cpat_log = os.path.join(config["cpat_dir"], "cpat.log")
+    params: # ... (params remain the same)
+        prefix = os.path.join(config["cpat_dir"], "cpat"),
+        opts = config["cpat_options"]
+    conda: "envs/cpat.yaml"
+    shell: # ... (shell command remains the same)
+        "mkdir -p {config[cpat_dir]} && "
+        "if [ -s {input.new_transcripts_fasta} ]; then "
+        "  (cpat.py -g {input.new_transcripts_fasta} -x {input.hexamer} -d {input.logit_model} -o {params.prefix} {params.opts} > {output.cpat_log} 2>&1 || true ) && "
+        "  touch {output.orf_prob} {output.no_orf} ; "
+        "else "
+        "  echo 'New transcripts FASTA is empty. Skipping CPAT. Creating dummy outputs.' > {output.cpat_log} && "
+        "  touch {output.orf_prob} {output.no_orf} ; "
+        "fi"
+
+rule classify_transcripts_with_cpat: # ... (rule remains the same)
+    input:
+        cuffcompare_gtf = os.path.join(config["comparison_dir"], "cuffcomp.combined.gtf"),
+        cpat_orf_prob = os.path.join(config["cpat_dir"], "cpat.ORF_prob.best.tsv"),
+        cpat_no_orf = os.path.join(config["cpat_dir"], "cpat.no_ORF.txt"),
+        cpat_cutoff = config["cpat_cutoff_file"]
+    output:
+        final_non_coding_gtf = config["final_non_coding_gtf"],
+        final_coding_gtf = config["final_coding_gtf"]
+    params: classification_dir = config["classification_dir"]
+    script: "scripts/classify_transcripts_cpat.py"
+
+# --- Ballgown DGE (Conditional) ---
+rule prepare_ballgown_inputs_list: # ... (rule remains the same)
+    input:
+        ballgown_dirs = expand(directory(os.path.join(config["ballgown_input_dir"], "{sample_id}")), sample_id=SAMPLE_IDS) if SAMPLE_IDS else []
+    output:
+        paths_list = temp(os.path.join(config["dge_dir"], "ballgown_sample_paths.txt"))
+    run: # ... (run block remains the same)
+        os.makedirs(os.path.dirname(output.paths_list), exist_ok=True)
+        with open(output.paths_list, "w") as f:
+            if not SAMPLE_IDS:
+                print("No samples defined, creating empty ballgown_sample_paths.txt")
+            for sample_id in SAMPLE_IDS:
+                sample_dir_path = os.path.join(config["ballgown_input_dir"], sample_id)
+                if os.path.isdir(sample_dir_path):
+                    f.write(f"{os.path.abspath(sample_dir_path)}\n")
+
+if config.get("metadata_file") and str(config.get("metadata_file")).strip() not in [None, "None", "null", ""]:
+    rule run_ballgown_dge: # ... (rule remains the same)
+        input:
+            script = "workflow/scripts/ballgown.R",
+            sample_paths_list = rules.prepare_ballgown_inputs_list.output.paths_list,
+            metadata = str(config["metadata_file"]),
+            _ballgown_sample_dirs_trigger = rules.prepare_ballgown_inputs_list.input.ballgown_dirs
+        output:
+            dge_transcripts = os.path.join(config["dge_dir"], config["dge_transcripts_file"]),
+            trans_expr = os.path.join(config["dge_dir"], config["transcript_expressions_file"])
+        params: workdir_for_r = config["dge_dir"]
+        conda: "envs/ballgown.yaml"
+        log: os.path.join(config["dge_dir"], "ballgown_dge.log")
+        shell: # ... (shell command remains the same)
+            "mkdir -p {params.workdir_for_r} && "
+            "if [ -s {input.sample_paths_list} ] && [ -s {input.metadata} ]; then "
+            "  Rscript {input.script} {params.workdir_for_r} {input.metadata} {input.sample_paths_list} > {log} 2>&1 ; "
+            "else "
+            "  echo 'Skipping Ballgown DGE due to empty sample paths list or metadata. Creating dummy outputs.' > {log} && "
+            "  touch {output.dge_transcripts} {output.trans_expr} ; "
+            "fi"
+
+# --- Feature Extraction ---
+rule gtf_to_bed:
+    input:
+        gtf = config["final_non_coding_gtf"] # Using the classified non-coding transcripts GTF
+    output:
+        # Use the prefix from config to define output paths
+        bed = config["target_bed_for_features_prefix"] + ".bed",
+        chr_bed = config["target_bed_for_features_prefix"] + ".chr.bed"
+    params:
+        script = "workflow/scripts/gtf_to_bed.sh"
+    conda: "envs/feature_tools.yaml"
+    log: config["target_bed_for_features_prefix"] + ".gtf_to_bed.log"
+    shell:
+        "bash {params.script} {input.gtf} {output.bed} {output.chr_bed} > {log} 2>&1"
+
+rule extract_track_features:
+    input:
+        # Use the .chr.bed version for tools expecting "chr" prefix
+        bed_file = config["target_bed_for_features_prefix"] + ".chr.bed",
+        # If track URL is a local file path, it could be an input dependency:
+        # local_track_file = lambda wildcards: [t["url"] for t in config["feature_tracks"] if t["name"] == wildcards.track_name and not t["url"].startswith("http")][0] if any(t["name"] == wildcards.track_name and not t["url"].startswith("http") for t in config["feature_tracks"]) else []
+    output:
+        # Store intermediate TSVs in a subdirectory per track for clarity
+        tsv = temp(os.path.join(config["feature_extraction_dir"], "{track_name}", "{track_name}.feature.tsv"))
+    params:
+        script = "workflow/scripts/get_track_features.sh",
+        track_name = "{track_name}",
+        track_url = lambda wildcards: [t["url"] for t in config["feature_tracks"] if t["name"] == wildcards.track_name][0],
+        track_type = lambda wildcards: [t["type"] for t in config["feature_tracks"] if t["name"] == wildcards.track_name][0],
+        processing_method = lambda wildcards: [t["processing_method"] for t in config["feature_tracks"] if t["name"] == wildcards.track_name][0],
+        offset = config["feature_extraction_offset"]
+    conda: "envs/feature_tools.yaml"
+    threads: 1 # get_track_features.sh is mostly serial for a single track after modifications
+    log: os.path.join(config["feature_extraction_dir"], "{track_name}", "{track_name}.log")
+    shell:
+        "mkdir -p $(dirname {output.tsv}) && "
+        "bash {params.script} --track_name {params.track_name} --url {params.track_url} --bed {input.bed_file} "
+        "--output_tsv {output.tsv} --offset {params.offset} --track_type {params.track_type} "
+        "--processing_method {params.processing_method} > {log} 2>&1"
+
+rule aggregate_features_to_table:
+    input:
+        # Use helper to get track names for expand
+        feature_tsvs = expand(os.path.join(config["feature_extraction_dir"], "{track_name}", "{track_name}.feature.tsv"), track_name=get_track_names(config.get("feature_tracks", []))),
+        # Use the non-chr.bed version for matching transcript IDs if needed
+        bed_file = config["target_bed_for_features_prefix"] + ".bed"
+    output:
+        final_table = config["final_feature_table_csv"]
+    params:
+        # Script directive will use the python from the (shared) conda env if specified at top-level or here
+        pass
+    conda: "envs/feature_tools.yaml" # Ensure pandas is here or in global env
+    log: os.path.join(config["feature_extraction_dir"], "aggregate_feature_table.log")
+    script:
+        "workflow/scripts/aggregate_feature_table.py"
+
+
+# --- Original example rules ---
+rule example_tool_local_input:
+    input: "results/dummy_input_for_example.txt"
+    output: touch("results/output_from_example_tool.txt")
+    conda: "envs/example_tool.yaml"
+    shell: "echo 'Running example tool on {input}' > {output} && samtools --version"
+
+rule create_dummy_input:
+    output: touch("results/dummy_input_for_example.txt")
+    shell: "echo 'This is a dummy input file.' > {output}"

@@ -1,0 +1,17 @@
+name: feature_tools_env
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - bedops>=2.4.39
+  - ucsc-tools>=400 # Using the meta-package for now. If issues, switch to individual tools.
+  # ucsc-bigwigaverageoverbed
+  # ucsc-bigbedsummary
+  # ucsc-bigwigsummary
+  # ucsc-bedtobigbed (if needed for local bigBed creation)
+  - gnu-parallel # If get_track_features.sh still uses it internally
+  - coreutils # For awk, sed, sort, etc.
+  - pandas # For aggregate_feature_table.py (might also be in global env)
+  - wget # For downloading tracks if get_track_features.sh handles downloads
+  - bedtools # Can be useful for various BED operations, alternative to some UCSC tools.

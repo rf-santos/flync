@@ -1,0 +1,7 @@
+name: sra_tools_env
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - sra-tools>=2.11 # Or a more recent version
+  - coreutils # for cut, egrep if used directly, though python handles parsing

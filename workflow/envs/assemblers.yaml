@@ -1,0 +1,8 @@
+name: assemblers_env
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - stringtie=2.1.7 # Use a recent version
+  - cuffcompare=2.2.1 # Or gffcompare
+  - gffread=0.12.7

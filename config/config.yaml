@@ -1,0 +1,109 @@
+output_dir: "results/"
+# samples: "path/to/samples.tsv" # This will be replaced by sample_sheet
+# genome_fasta: "genome/genome.fa" # This will be replaced by the output of prepare_genome
+
+# Genome preparation
+genome_dir: "workflow/genome_data"
+ensembl_base_url: "https://ftp.ensembl.org/pub/release-106/fasta/drosophila_melanogaster/dna/"
+ensembl_gtf_url: "https://ftp.ensembl.org/pub/release-106/gtf/drosophila_melanogaster/Drosophila_melanogaster.BDGP6.32.106.chr.gtf.gz"
+genome_fasta_name: "Drosophila_melanogaster.BDGP6.32.dna.primary_assembly" # Base name for FASTA files
+genome_chromosomes: ["2L", "2R", "3L", "3R", "4", "X", "Y", "mitochondrion_genome"]
+
+# SRA info (original, might be superseded or used for pre-fetching if desired)
+sra_accession_file: "path/to/your/sra_list.txt" # User needs to provide this
+sra_info_csv: "results/runinfo.csv"
+
+# Sample sheet
+sample_sheet: "config/sample_sheet.tsv" # User needs to create this
+
+# HISAT2 Indexing
+hisat2_index_dir: "workflow/genome_data/hisat2_index" # Directory for index files
+hisat2_index_prefix: "workflow/genome_data/hisat2_index/genome_idx" # Output prefix for index
+splice_sites_file: "workflow/genome_data/genome.ss"   # Output for splice sites
+
+# Mapping
+mapping_dir: "results/mapping"
+hisat2_options: "--dta --dta-cufflinks" # Common options
+# threads per job can be managed by Snakemake's --cores and rule-specific threads
+
+# SRA download (if handling SRA accessions directly in mapping or a dedicated pre-download rule)
+sra_download_dir: "results/sra_downloads" # If not handled by a separate rule before mapping
+
+# StringTie Assembly
+assembly_dir: "results/assembly"
+stringtie_assemble_options: "" # e.g., "-j 3" for junction coverage
+
+# StringTie Merge
+merged_gtf_dir: "results/assembly_merged" # Directory for merged outputs
+merged_gtf_name: "merged_transcripts.gtf"
+merged_new_transcripts_gtf_name: "merged_new_transcripts.gtf" # GTF with only novel transcripts from merge
+merged_transcripts_fasta_name: "assembled_transcripts.fa" # FASTA for all merged transcripts
+merged_new_transcripts_fasta_name: "assembled_new_transcripts.fa" # FASTA for novel merged transcripts
+stringtie_merge_options: "-l MSTRG" # Example: set transcript prefix
+
+# Cuffcompare (or gffcompare)
+comparison_dir: "results/comparison"
+cuffcompare_options: "-R" # Example: ignore reference transcripts present in merged.gtf, show only novel
+
+# StringTie Quantification for Ballgown
+ballgown_input_dir: "results/ballgown_inputs" # Main directory for per-sample subdirs
+stringtie_quant_options: "-e -B" # Standard for Ballgown
+
+# CPAT & Coding Potential
+cpat_dir: "results/cpat"
+# These model files should be downloaded once (e.g. in prepare_genome or a dedicated rule)
+# or included in a tools directory and referenced here.
+cpat_hexamer_file: "workflow/resources/cpat_models/fly_Hexamer.tsv"
+cpat_logit_model_file: "workflow/resources/cpat_models/Fly_logitModel.RData"
+cpat_cutoff_file: "workflow/resources/cpat_models/fly_cutoff.txt" # File containing the cutoff value
+cpat_options: "" # e.g., --min_orf_len=50
+
+# Classification outputs
+classification_dir: "results/classification"
+final_non_coding_gtf: "results/final_non_coding_transcripts.gtf"
+final_coding_gtf: "results/final_coding_transcripts.gtf"
+
+# Differential Gene Expression (Ballgown)
+dge_dir: "results/dge_ballgown"
+metadata_file: null
+dge_transcripts_file: "dge_transcripts.csv"
+dge_exons_file: "dge_exons.csv"
+transcript_expressions_file: "trans_expr.csv"
+
+# Feature Extraction
+feature_extraction_dir: "results/feature_extraction"
+# Input BED file for feature extraction (using the .chr.bed version for UCSC tools)
+# Path derived from final_non_coding_gtf, specific name set here for clarity
+# Example: if final_non_coding_gtf is results/final_non_coding_transcripts.gtf
+# then target_bed_for_features could be results/classification/final_non_coding_transcripts.chr.bed
+target_bed_for_features_prefix: "results/classification/final_non_coding_transcripts" # Prefix for gtf_to_bed outputs
+# target_bed_for_features: results/classification/final_non_coding_transcripts.chr.bed (derived)
+# target_bed_for_feature_table: results/classification/final_non_coding_transcripts.bed (derived)
+
+# Feature tracks (replace static/tracksFile.tsv and local discovery)
+feature_tracks:
+  - name: "CAGE_neg"
+    url: "https://epd.expasy.org/epd/ucsc/epdHub/dm6/All_CAGE_minus.bw"
+    type: "bw"
+    processing_method: "bigWigAverageOverBed" # Method for get_track_features.sh
+  - name: "CAGE_pos"
+    url: "https://epd.expasy.org/epd/ucsc/epdHub/dm6/All_CAGE_plus.bw"
+    type: "bw"
+    processing_method: "bigWigAverageOverBed"
+  - name: "GCcont"
+    url: "http://hgdownload.soe.ucsc.edu/gbdb/dm6/bbi/gc5BaseBw/gc5Base.bw"
+    type: "bw"
+    processing_method: "bigWigAverageOverBed"
+  - name: "H3K27ac" # Example from original tracksFile.tsv
+    url: "http://ftp.flybase.net/genomes/Drosophila_melanogaster/modERN/Current/tracks/wig/BDGP6/S2-DRSC_H3K27ac_0-4h_E_825_trimmed.norm5.wig.bw"
+    type: "bw"
+    processing_method: "bigWigAverageOverBed"
+  # Add other tracks, ensuring 'name' is unique and 'type'/'processing_method' are informative for the script.
+  # For local files: url: "path/to/local/my_track.bb", type: "bb"
+  # Make sure local paths are accessible by the Snakemake execution environment.
+
+# Parameters for get-features.sh (now get_track_features.sh)
+feature_extraction_offset: 100
+
+# Final aggregated feature table
+final_feature_table_csv: "results/ml_feature_table.csv"

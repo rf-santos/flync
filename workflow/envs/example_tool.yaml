@@ -1,0 +1,6 @@
+name: example_tool_env
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - samtools=1.15 # Example dependency

@@ -1,0 +1,9 @@
+name: aligners_env
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - hisat2=2.2.1
+  - samtools=1.15 # Ensure version compatibility if needed
+  - python>=3.6 # For hisat2_extract_splice_sites.py
+  - sra-tools>=2.11 # If SRA download is part of the mapping rule

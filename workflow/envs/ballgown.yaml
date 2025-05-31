@@ -1,0 +1,16 @@
+name: ballgown_env
+channels:
+  - bioconda
+  - conda-forge
+  - r # Ensure R channel is present
+dependencies:
+  - r-base>=4.0
+  - bioconductor-ballgown>=2.24 # Adjust version as needed
+  - bioconductor-genefilter # Dependency of Ballgown, explicitly listing is good
+  - r-optparse # For parsing arguments in R script if we modify it
+  # Ballgown might pull r-rcolorbrewer and other graphical dependencies.
+  # Explicitly listing common ones if issues arise:
+  # - r-rcolorbrewer
+  # - r-ggplot2
+  # - bioconductor-clusterprofiler # (if used for GO later, not directly by ballgown)
+  # - bioconductor-annotationdbi # (if used for GO later)

@@ -1,0 +1,15 @@
+name: cpat_env
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=2.7 # CPAT is often a Python 2 tool
+  - numpy # A common CPAT dependency
+  - cpat=1.2.4 # Hypothetical package, or ensure cpat.py is manually added to PATH
+  # Add other specific dependencies if known e.g. bx-python for some versions
+  # Actual CPAT installations might involve pip installing a specific version or commit.
+  # For example, if cpat is available via pip for python 2.7:
+  # - pip
+  # - pip:
+  #   - CPAT==1.2.4

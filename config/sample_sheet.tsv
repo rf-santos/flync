@@ -1,0 +1,5 @@
+sample_id	type	fq1	fq2	sra_accession
+sampleA	PAIRED	path/to/A_1.fastq.gz	path/to/A_2.fastq.gz
+sampleB	SINGLE	path/to/B.fastq.gz
+sampleC	PAIRED			SRR123456
+sampleD	SINGLE			SRR123457
