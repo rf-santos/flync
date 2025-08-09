@@ -1,0 +1,38 @@
+name: flync_refactored
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  # General
+  - python=3.10
+  - pip
+  - snakemake
+  - pandas
+  - numpy
+  - scipy
+  - scikit-learn
+  - joblib
+  - biopython
+  - pybedtools
+  - matplotlib
+  - seaborn
+  # Bioinformatics tools
+  - sra-tools
+  - hisat2
+  - stringtie
+  - samtools
+  - bedtools
+  - gffread
+  - cufflinks
+  - bedops
+  - ucsc-bigbedsummary
+  - ucsc-bigwigaverageoverbed
+  - ucsc-bigwigsummary
+  - entrez-direct
+  # R dependencies
+  - r-base
+  - bioconductor-ballgown
+  # Pip dependencies
+  - cpat
+  - pickle-mixin

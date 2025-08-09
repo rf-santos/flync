@@ -1,0 +1,290 @@
+# Snakemake workflow for flync
+import os
+
+# --- Configuration ---
+config = {
+    "genome_release": "106",
+    "genome_base_url": "https://ftp.ensembl.org/pub/release-{release}/fasta/drosophila_melanogaster/dna/",
+    "genome_chromosomes": ["2L", "2R", "3L", "3R", "4", "X", "Y", "mitochondrion_genome"],
+    "genome_file_pattern": "Drosophila_melanogaster.BDGP6.32.dna.primary_assembly.{chrom}.fa.gz",
+    "annotation_url": "https://ftp.ensembl.org/pub/release-{release}/gtf/drosophila_melanogaster/Drosophila_melanogaster.BDGP6.32.{release}.chr.gtf.gz",
+    "threads": 8
+}
+
+# --- Helper functions ---
+def get_genome_chromosome_urls(wildcards):
+    return [
+        os.path.join(
+            config["genome_base_url"].format(release=config["genome_release"]),
+            config["genome_file_pattern"].format(chrom=chrom)
+        )
+        for chrom in config["genome_chromosomes"]
+    ]
+
+# --- Rules ---
+
+SAMPLES = [line.strip() for line in open("samples.txt")]
+
+rule all:
+    input:
+        "results/ml-classified-final.csv"
+
+rule download_genome_chromosomes:
+    output:
+        temp(
+            expand(
+                "resources/genome/chrs/genome.{chrom}.fa.gz",
+                chrom=config["genome_chromosomes"]
+            )
+        )
+    params:
+        urls=lambda wildcards: get_genome_chromosome_urls(wildcards)
+    shell:
+        """
+        for i in $(seq 0 $(({len(params.urls)} - 1))); do
+            wget -q -O {output[i]} {params.urls[i]}
+        done
+        """
+
+rule concatenate_genome:
+    input:
+        expand(
+            "resources/genome/chrs/genome.{chrom}.fa.gz",
+            chrom=config["genome_chromosomes"]
+        )
+    output:
+        "resources/genome/genome.fa"
+    shell:
+        "zcat {input} > {output}"
+
+rule download_annotation:
+    output:
+        "resources/genome/genome.gtf"
+    params:
+        url=config["annotation_url"].format(release=config["genome_release"])
+    shell:
+        """
+        wget -q -O {output}.gz {params.url}
+        gzip -v -d --force {output}.gz
+        """
+
+rule build_hisat2_index:
+    input:
+        "resources/genome/genome.fa"
+    output:
+        multiext("resources/genome/genome.idx", ".1.ht2", ".2.ht2", ".3.ht2", ".4.ht2", ".5.ht2", ".6.ht2", ".7.ht2", ".8.ht2")
+    params:
+        prefix="resources/genome/genome.idx"
+    threads:
+        config["threads"]
+    shell:
+        "hisat2-build -p {threads} {input} {params.prefix}"
+
+rule extract_splice_sites:
+    input:
+        "resources/genome/genome.gtf"
+    output:
+        "resources/genome/genome.ss"
+    shell:
+        "hisat2_extract_splice_sites.py {input} > {output}"
+
+rule get_sra_info:
+    input:
+        "samples.txt"
+    output:
+        "results/runinfo.csv"
+    shell:
+        """
+        echo sra_access,avg_len,strategy,lib_prep,omic,read_layout,bio_proj > {output}
+        while read i; do
+            efetch -db sra -format runinfo -id $i | cut -f1,7,13,14,15,16,22 -d, | egrep -v "^Run," >> {output}
+        done < {input}
+        """
+
+rule download_sra:
+    output:
+        "results/data/{sample}/{sample}.fastq.gz"
+    params:
+        sample="{sample}"
+    threads:
+        config["threads"]
+    shell:
+        """
+        prefetch -O results/data/{params.sample} {params.sample}
+        fasterq-dump -f -3 -e {threads} -O results/data/{params.sample} {params.sample}
+        if [ ! -e results/data/{params.sample}/{params.sample}.fastq.gz ]; then
+            gzip results/data/{params.sample}/{params.sample}.fastq
+        fi
+        """
+
+rule hisat2_map:
+    input:
+        fastq="results/data/{sample}/{sample}.fastq.gz",
+        index=expand("resources/genome/genome.idx.{i}.ht2", i=range(1, 9)),
+        splice_sites="resources/genome/genome.ss"
+    output:
+        temp("results/mapped/{sample}.sam")
+    params:
+        index_prefix="resources/genome/genome.idx"
+    threads:
+        config["threads"]
+    shell:
+        "hisat2 -p {threads} -x {params.index_prefix} -U {input.fastq} -S {output} --dta --dta-cufflinks --known-splicesite-infile {input.splice_sites}"
+
+rule sam_to_bam:
+    input:
+        "results/mapped/{sample}.sam"
+    output:
+        "results/mapped/{sample}.sorted.bam"
+    threads:
+        config["threads"]
+    shell:
+        """
+        samtools view -@ {threads} -b -o {output}.tmp {input}
+        samtools sort -@ {threads} -o {output} {output}.tmp
+        rm {output}.tmp
+        samtools index {output}
+        """
+
+rule stringtie_assemble:
+    input:
+        bam="results/mapped/{sample}.sorted.bam",
+        gtf="resources/genome/genome.gtf"
+    output:
+        "results/assembled/{sample}.gtf"
+    threads:
+        config["threads"]
+    shell:
+        "stringtie {input.bam} -G {input.gtf} -o {output} -p {threads}"
+
+rule stringtie_merge:
+    input:
+        expand("results/assembled/{sample}.gtf", sample=SAMPLES)
+    output:
+        "results/merged/merged.gtf"
+    params:
+        gtf_list="results/merged/gtf_list.txt"
+    shell:
+        """
+        ls -1 {input} > {params.gtf_list}
+        stringtie --merge -G resources/genome/genome.gtf -o {output} {params.gtf_list}
+        """
+
+rule cuffcompare:
+    input:
+        merged_gtf="results/merged/merged.gtf",
+        ref_gtf="resources/genome/genome.gtf"
+    output:
+        "results/cuffcompare/cuffcomp.gtf"
+    shell:
+        "cuffcompare -R -r {input.ref_gtf} {input.merged_gtf} -o {output}"
+
+rule gffread_extract_new:
+    input:
+        "results/merged/merged.gtf"
+    output:
+        "results/new_transcripts.gtf"
+    shell:
+        "awk '$12 ~ /^\"MSTRG*/' {input} > {output}"
+
+rule tux2count:
+    input:
+        bam="results/mapped/{sample}.sorted.bam",
+        merged_gtf="results/merged/merged.gtf"
+    output:
+        "results/counts/{sample}.gtf"
+    shell:
+        "stringtie -eB {input.bam} -G {input.merged_gtf} -o {output}"
+
+rule download_cpat_models:
+    output:
+        logit_model=temp("resources/cpat/Fly_logitModel.RData"),
+        hexamer=temp("resources/cpat/fly_Hexamer.tsv"),
+        cutoff=temp("resources/cpat/fly_cutoff.txt")
+    shell:
+        """
+        wget --no-check-certificate -q https://sourceforge.net/projects/rna-cpat/files/v1.2.2/prebuilt_model/Fly_logitModel.RData/download -O {output.logit_model}
+        wget --no-check-certificate -q https://sourceforge.net/projects/rna-cpat/files/v1.2.2/prebuilt_model/fly_Hexamer.tsv/download -O {output.hexamer}
+        wget --no-check-certificate -q https://sourceforge.net/projects/rna-cpat/files/v1.2.2/prebuilt_model/fly_cutoff.txt/download -O {output.cutoff}
+        """
+
+rule cpat:
+    input:
+        transcripts="results/new_transcripts.gtf",
+        genome="resources/genome/genome.fa",
+        logit_model="resources/cpat/Fly_logitModel.RData",
+        hexamer="resources/cpat/fly_Hexamer.tsv"
+    output:
+        "results/cpat/cpat.ORF_prob.best.tsv",
+        "results/cpat/cpat.no_ORF.txt"
+    params:
+        prefix="results/cpat/cpat"
+    shell:
+        """
+        gffread -w {input.transcripts}.fa -g {input.genome} {input.transcripts}
+        cpat.py -x {input.hexamer} -d {input.logit_model} -g {input.transcripts}.fa -o {params.prefix}
+        """
+
+rule classify_transcripts:
+    input:
+        cuffcompare_gtf="results/cuffcompare/cuffcomp.combined.gtf",
+        cpat_orf="results/cpat/cpat.ORF_prob.best.tsv",
+        cpat_no_orf="results/cpat/cpat.no_ORF.txt",
+        cutoff="resources/cpat/fly_cutoff.txt"
+    output:
+        non_coding="results/new-non-coding.gtf",
+        coding="results/new-coding.gtf"
+    shell:
+        "python scripts/classify_transcripts.py {input.cuffcompare_gtf} {input.cpat_orf} {input.cpat_no_orf} {input.cutoff} {output.non_coding} {output.coding}"
+
+rule ballgown:
+    input:
+        counts=expand("results/counts/{sample}.gtf", sample=SAMPLES),
+        metadata="metadata.csv"
+    output:
+        "results/dge_transcripts.csv",
+        "results/dge_exons.csv",
+        "results/trans_expr.csv"
+    shell:
+        "Rscript scripts/ballgown.R results {input.metadata}"
+
+rule get_features:
+    input:
+        bed="results/new-non-coding.bed",
+        tracks="static/tracksFile.tsv"
+    output:
+        directory("results/features")
+    threads:
+        config["threads"]
+    shell:
+        "python scripts/get_features.py {input.bed} {input.tracks} {output}"
+
+rule feature_table:
+    input:
+        features="results/features",
+        bed="results/new-non-coding.bed"
+    output:
+        "results/new-non-coding.csv"
+    shell:
+        "python scripts/feature-table.py . results {input.bed}"
+
+rule predict:
+    input:
+        feature_table="results/new-non-coding.csv",
+        model="model/rf_dm6_lncrna_classifier.model"
+    output:
+        "results/ml-classified-new-non-coding.csv"
+    shell:
+        "python scripts/predict.py . results new-non-coding"
+
+rule final_table:
+    input:
+        dge="results/dge_transcripts.csv",
+        expr="results/trans_expr.csv",
+        ml_classified="results/ml-classified-new-non-coding.csv",
+        cuffcompare_tracking="results/cuffcompare/cuffcomp.gtf.tracking",
+        bed="results/new-non-coding.bed"
+    output:
+        "results/ml-classified-final.csv"
+    shell:
+        "python scripts/final-table.py . results {input.bed}"
